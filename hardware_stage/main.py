@@ -33,8 +33,14 @@ RESERVE_POS = {
 }
 
 
-ser = serial.Serial('COM3', 115200) 
+
 BOARD = np.zeros((6, 6), dtype=int)
+# Serial port for the arm
+ser = serial.Serial("COM4", baudrate=115200, dsrdtr=None)
+ser.setRTS(False)
+ser.setDTR(False)
+# Serial port for the Solenoid
+ser2 = serial.Serial('COM3', 115200) 
 POSES = {}
 vision_system = BoardPerception()
 
@@ -152,13 +158,13 @@ def movetocmd(move: str) -> list:
 
 def pick():
     """Activate the electromagnet to grip a piece."""
-    ser.write(b'1')
+    ser2.write(b'1')
 
 
 
 def place():
     """Deactivate the electromagnet to release a piece."""
-    ser.write(b'0')
+    ser2.write(b'0')
 
 
 
