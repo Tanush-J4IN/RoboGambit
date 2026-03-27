@@ -6,13 +6,14 @@ import socket
 import struct
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-SERVER_IP   = '10.168.70.199' 
-SERVER_PORT = 9999
+SERVER_IP   = '192.168.4.2' 
+SERVER_PORT = 9992
 
+# Updated for 640x480 resolution stream
 CAMERA_MATRIX = np.array([
-    [1030.4890823364258, 0,   960],
-    [0, 1030.489103794098, 540],
-    [0,                0,   1]
+    [343.49, 0,      320.0],
+    [0,      457.99, 240.0],
+    [0,      0,      1.0]
 ], dtype=np.float32)
 DIST_COEFFS = np.zeros((1, 5), dtype=np.float32)
 
@@ -29,7 +30,7 @@ BOARD_SIZE  = 6
 PIECE_IDS   = set(range(1, 11))
 
 class BoardPerception:
-    def __init__(self):
+    def __init__(self, connect_socket=True):
         """Initialize ArUco detector and connect to the camera stream."""
         aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
         params     = aruco.DetectorParameters()
@@ -37,7 +38,7 @@ class BoardPerception:
         params.adaptiveThreshWinSizeMin    = 3
         params.adaptiveThreshWinSizeMax    = 35
         params.adaptiveThreshWinSizeStep   = 10
-        params.minMarkerPerimeterRate      = 0.03
+        params.minMarkerPerimeterRate      = 0.01
         params.maxMarkerPerimeterRate      = 4.0
         params.polygonalApproxAccuracyRate = 0.03
         params.minCornerDistanceRate       = 0.05
@@ -47,14 +48,16 @@ class BoardPerception:
         self.H_matrix      = None
         self.corner_pixels = {}
         
-        # Connect to socket
-        print(f"Connecting to {SERVER_IP}:{SERVER_PORT} ...")
-        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.client_socket.connect((SERVER_IP, SERVER_PORT))
-        print("Connected ✓")
-
-        self.payload_size = struct.calcsize("Q")
-        self.data_buffer  = b""
+        # Conditionally connect to socket
+        if connect_socket:
+            print(f"Connecting to {SERVER_IP}:{SERVER_PORT} ...")
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((SERVER_IP, SERVER_PORT))
+            print("Connected ✓")
+            self.payload_size = struct.calcsize("Q")
+            self.data_buffer  = b""
+        else:
+            self.client_socket = None
 
     def _recv_frame(self):
         """Internal helper to read one frame from the socket."""
@@ -88,30 +91,38 @@ class BoardPerception:
         best_row, best_col, min_dist = None, None, float('inf')
         for row in range(BOARD_SIZE):
             for col in range(BOARD_SIZE):
-                cx = TOP_LEFT_X - (row * SQUARE_SIZE + SQUARE_SIZE / 2)
-                cy = TOP_LEFT_Y - (col * SQUARE_SIZE + SQUARE_SIZE / 2)
+                # FIXED: col is X-axis, row is Y-axis
+                cx = TOP_LEFT_X - (col * SQUARE_SIZE + SQUARE_SIZE / 2)
+                cy = TOP_LEFT_Y - (row * SQUARE_SIZE + SQUARE_SIZE / 2)
                 d  = math.hypot(wx - cx, wy - cy)
                 if d < min_dist:
                     min_dist, best_row, best_col = d, row, col
         return best_row, best_col
 
     def get_latest_state(self):
-        """
-        Reads a frame and returns the current board state and physical poses.
-        Returns: (board_matrix, piece_poses_dict)
-        """
+        """Reads a live frame from the socket and returns the board state."""
+        if not self.client_socket:
+            print("[ERROR] Cannot fetch live frame: Socket not connected.")
+            return None, None
+            
         frame = self._recv_frame()
         if frame is None:
             return None, None
+            
+        return self.get_latest_state_from_frame(frame)
 
-        frame = cv2.undistort(frame, CAMERA_MATRIX, DIST_COEFFS, None, CAMERA_MATRIX)
+    def get_latest_state_from_frame(self, frame):
+        """Processes a single provided frame to extract board state and poses."""
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.detector.detectMarkers(gray)
 
         board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=int)
-        poses = {} # Dictionary to store {piece_id: (x, y)}
+        poses = {} 
 
         if ids is not None:
+            # Draw green boxes for the debug image
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+
             # Update corners for homography
             for i, mid in enumerate(ids.flatten()):
                 if mid in CORNER_WORLD:
@@ -130,21 +141,21 @@ class BoardPerception:
                     if mid not in PIECE_IDS:
                         continue
                     
-                    # 1. Get average pixel coordinates of the marker
                     c = corners[i][0]
                     px, py = float(np.mean(c[:, 0])), float(np.mean(c[:, 1]))
                     
-                    # 2. Convert to calibrated world (x,y) poses
                     wx, wy = self._pixel_to_world(px, py)
                     poses[mid] = (wx, wy)
                     
-                    # 3. Map to 6x6 grid
                     row, col = self._world_to_cell(wx, wy)
                     if row is not None:
+                        if board[row][col] != 0:
+                            print(f"\n[WARNING] PIECE OVERLAP! ID {mid} and ID {board[row][col]} are both snapping to cell [{row}][{col}]. Center them!")
                         board[row][col] = mid
 
         return board, poses
 
     def cleanup(self):
         """Close the socket connection."""
-        self.client_socket.close()
+        if self.client_socket:
+            self.client_socket.close()
