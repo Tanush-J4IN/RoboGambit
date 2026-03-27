@@ -4,6 +4,7 @@ import requests
 import argparse
 import serial
 import time
+import perception
 from perception import BoardPerception
 
 
@@ -171,9 +172,7 @@ def place():
 def send_cmd(command: str):
     """Send a single JSON command to the robot arm via HTTP."""
     print(f"Sending command: {command}")
-    ip_addr = "192.168.4.1"
-    url = "http://" + ip_addr + "/js?json=" + command
-    response = requests.get(url)
+    ser.write(command.encode() + b'\n')
 
 COL_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F']
 LOG_FILE = "game_log.txt"
