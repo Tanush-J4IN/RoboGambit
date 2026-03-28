@@ -6,16 +6,41 @@ import serial
 import time
 import perception
 from perception import BoardPerception
-
-
 import json
+import os
 
-# Board geometry — must match perception.py
+# ─── LINUX OS COMPATIBILITY FIX ───────────────────────────────────────────────
+original_apply_move = game.apply_move
+
+def safe_apply_move(board, piece, r1, c1, r2, c2, promo, offboard, king_tracker, current_hash, tracker):
+    if type(current_hash) is int and current_hash == 0:
+        current_hash = np.uint64(0)
+    return original_apply_move(board, piece, r1, c1, r2, c2, promo, offboard, king_tracker, current_hash, tracker)
+
+game.apply_move = safe_apply_move
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── DYNAMIC CALIBRATION LOADER ──
+CALIB = {
+    "TOP_LEFT_X": 133.0,
+    "TOP_LEFT_Y": -119.4,
+    "SQUARE_SIZE_X": 71.0,
+    "SQUARE_SIZE_Y": 59.0
+}
+if os.path.exists("robot_calib.json"):
+    with open("robot_calib.json", "r") as f:
+        CALIB = json.load(f)
+        print("Loaded physical robot calibration from robot_calib.json ✓")
+else:
+    print("No robot_calib.json found. Using fallback coordinates.")
+# ────────────────────────────────
+
+# Board geometry
 _COL_MAP     = {'A':0,'B':1,'C':2,'D':3,'E':4,'F':5}
 
-# Arm Z heights in mm — tune these to your physical setup
+# Arm Z heights
 Z_HOVER = 200   # safe travel height above the board
-Z_PICK  =  20   # surface level to engage the piece
+Z_PICK  = -80   # surface level to engage the piece
 
 ARM_SPD = 0.3   # speed for T=104 command
 T_ANGLE = 3.14  # wrist angle (rad) — straight down
@@ -23,7 +48,7 @@ T_ANGLE = 3.14  # wrist angle (rad) — straight down
 # Off-board discard zone for captured/promoted-out pieces (world mm)
 DISCARD_X, DISCARD_Y = -150, 0
 
-# Reserve positions for promotion pieces (world mm) — tune to your layout
+# Reserve positions for promotion pieces (world mm)
 RESERVE_POS = {
     4: (-150, -100),   # White Queen  reserve
     3: (-150, -200),   # White Bishop reserve
@@ -33,21 +58,18 @@ RESERVE_POS = {
     7:  (450, -300),   # Black Knight reserve
 }
 
-
-
 BOARD = np.zeros((6, 6), dtype=int)
-# Serial port for the arm
-ser = serial.Serial("COM4", baudrate=115200, dsrdtr=None)
+# Serial ports
+ser = serial.Serial("/dev/ttyUSB1", baudrate=115200, dsrdtr=None)
 ser.setRTS(False)
 ser.setDTR(False)
-# Serial port for the Solenoid
-ser2 = serial.Serial('COM3', 115200) 
+ser2 = serial.Serial('/dev/ttyUSB0', 115200) 
+
 POSES = {}
 vision_system = BoardPerception()
 
 def get_board_state() -> np.ndarray:
     """Use the perception module to get the current board state."""
-    # add code to update BOARD using perception.board
     global BOARD, POSES
     latest_board, latest_poses = vision_system.get_latest_state()
     if latest_board is not None:
@@ -57,32 +79,20 @@ def get_board_state() -> np.ndarray:
 
 def move(playing_white) -> str:
     """Determine the best move using the game module."""
-    return game.get_best_move(get_board_state(),playing_white)
+    return game.get_best_move(get_board_state(), playing_white)
 
-
-def movetocmd(move: str) -> list:
-    """
-    Convert a move string into an ordered list of robot steps.
-
-    Each element is either:
-      - A JSON string  → pass to send_cmd()
-      - "PICK"         → call pick()
-      - "PLACE"        → call place()
-
-    """
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
+def movetocmd(move_str: str) -> list:
     def cell_to_world(cell: str):
-        """'B3' → (wx, wy) in mm, using the same formula as perception.py."""
-        col = _COL_MAP[cell[0].upper()]
-        row = int(cell[1]) - 1
-        wx = perception.TOP_LEFT_X - (row * perception.SQUARE_SIZE + perception.SQUARE_SIZE / 2)
-        wy = perception.TOP_LEFT_Y - (col * perception.SQUARE_SIZE + perception.SQUARE_SIZE / 2)
+        """Translates the 6x6 grid into physical Robot coordinates."""
+        row_idx = ord(cell[0].upper()) - ord('A')
+        col_idx = int(cell[1]) - 1
+        
+        # Pulls directly from your CALIB dictionary
+        wx = CALIB["TOP_LEFT_X"] + (row_idx * CALIB["SQUARE_SIZE_X"])
+        wy = CALIB["TOP_LEFT_Y"] + (col_idx * CALIB["SQUARE_SIZE_Y"])
         return wx, wy
 
     def arm_goto(x, y, z):
-        """Build a Waveshare T=104 (CMD_XYZT_GOAL_CTRL) JSON command."""
         return json.dumps({
             "T": 104,
             "x": round(x, 1),
@@ -93,39 +103,33 @@ def movetocmd(move: str) -> list:
         })
 
     def pick_from(wx, wy):
-        """Steps to hover → descend → PICK → raise at world position."""
         return [
-            arm_goto(wx, wy, Z_HOVER),   # hover above cell
-            arm_goto(wx, wy, Z_PICK),    # descend to piece
-            "PICK",                       # electromagnet ON
-            arm_goto(wx, wy, Z_HOVER),   # raise back up
+            arm_goto(wx, wy, Z_HOVER),
+            arm_goto(wx, wy, Z_PICK),
+            "PICK",
+            arm_goto(wx, wy, Z_HOVER),
         ]
 
     def place_at(wx, wy):
-        """Steps to hover → descend → PLACE → raise at world position."""
         return [
-            arm_goto(wx, wy, Z_HOVER),   # hover above target
-            arm_goto(wx, wy, Z_PICK),    # descend to surface
-            "PLACE",                      # electromagnet OFF
-            arm_goto(wx, wy, Z_HOVER),   # raise back up
+            arm_goto(wx, wy, Z_HOVER),
+            arm_goto(wx, wy, Z_PICK),
+            "PLACE",
+            arm_goto(wx, wy, Z_HOVER),
         ]
 
-    # ── Parse move string ─────────────────────────────────────────────────────
-    move_str = move
     promo_id = None
-
     if ":" in move_str:
-        _, move_str = move_str.split(":", 1)       # strip "piece_id:"
+        _, move_str = move_str.split(":", 1)
 
     if "=" in move_str:
         move_str, promo_str = move_str.split("=", 1)
-        promo_id = int(promo_str)                  # piece to promote to
+        promo_id = int(promo_str)
 
     src_cell, dst_cell = move_str.split("->")
     src_x, src_y = cell_to_world(src_cell)
     dst_x, dst_y = cell_to_world(dst_cell)
 
-    # ── Check for capture (enemy piece sitting at destination?) ───────────────
     board = get_board_state()
     dst_row = int(dst_cell[1]) - 1
     dst_col = _COL_MAP[dst_cell[0].upper()]
@@ -133,44 +137,29 @@ def movetocmd(move: str) -> list:
 
     steps = []
 
-    # ── 1. Capture: clear the destination square first ────────────────────────
     if is_capture:
         steps += pick_from(dst_x, dst_y)
         steps += place_at(DISCARD_X, DISCARD_Y)
 
-    # ── 2. Main move: lift our piece from source, set it at destination ───────
     steps += pick_from(src_x, src_y)
     steps += place_at(dst_x, dst_y)
 
-    # ── 3. Promotion: swap pawn for the promoted piece ────────────────────────
     if promo_id is not None:
         res_x, res_y = RESERVE_POS[promo_id]
-
-        # Remove pawn from promotion square → discard
         steps += pick_from(dst_x, dst_y)
         steps += place_at(DISCARD_X, DISCARD_Y)
-
-        # Bring promoted piece from reserve → promotion square
         steps += pick_from(res_x, res_y)
         steps += place_at(dst_x, dst_y)
 
     return steps
 
-
 def pick():
-    """Activate the electromagnet to grip a piece."""
     ser2.write(b'1')
 
-
-
 def place():
-    """Deactivate the electromagnet to release a piece."""
     ser2.write(b'0')
 
-
-
 def send_cmd(command: str):
-    """Send a single JSON command to the robot arm via HTTP."""
     print(f"Sending command: {command}")
     ser.write(command.encode() + b'\n')
 
@@ -180,11 +169,10 @@ LOG_FILE = "game_log.txt"
 def _idx_to_cell(row: int, col: int) -> str:
     return f"{COL_LETTERS[col]}{row + 1}"
 
-
 def log_move(prev_board: np.ndarray, curr_board: np.ndarray, log_file: str = LOG_FILE):
-    vacated  = []   # had a piece, now empty  → this is the source square
-    arrived  = []   # was empty, now has piece → destination (no capture)
-    replaced = []   # had one piece, now different piece → capture destination
+    vacated  = []
+    arrived  = []
+    replaced = []
 
     for r in range(6):
         for c in range(6):
@@ -201,26 +189,22 @@ def log_move(prev_board: np.ndarray, curr_board: np.ndarray, log_file: str = LOG
     if not vacated:
         return 
 
-    # For perception glitches, confirming source of moves
     src_r, src_c, moved_piece = vacated[0]
     src_cell = _idx_to_cell(src_r, src_c)
-
     promo_id = None
 
-    if arrived:                                # piece landed on an empty square
+    if arrived:
         dst_r, dst_c, dst_piece = arrived[0]
-        if dst_piece != moved_piece:           # different piece ID → promotion
+        if dst_piece != moved_piece:
             promo_id = dst_piece
-    elif replaced:                             # piece landed on an occupied square → capture
+    elif replaced:
         dst_r, dst_c, _, dst_piece = replaced[0]
-        if dst_piece != moved_piece:           # different piece ID → capture + promotion (rare)
+        if dst_piece != moved_piece:
             promo_id = dst_piece
     else:
-        return  # Can't determine destination; skip
+        return
 
     dst_cell = _idx_to_cell(dst_r, dst_c)
-
-    
     move_str = f"{moved_piece}:{src_cell}->{dst_cell}"
     if promo_id is not None:
         move_str += f"={promo_id}"
@@ -228,7 +212,6 @@ def log_move(prev_board: np.ndarray, curr_board: np.ndarray, log_file: str = LOG
     with open(log_file, 'a') as f:
         f.write(move_str + '\n')
     return (moved_piece, src_r, src_c, dst_r, dst_c, promo_id)
-
 
 def log_result(result: str, log_file: str = LOG_FILE):
     with open(log_file, 'a') as f:
@@ -247,61 +230,85 @@ def check_legal(prev_board, move_tuple):
     return move_tuple in game.get_all_moves(prev_board, is_white_move, offboard, king)
 
 def get_stable_board_state(required_frames=10):
-    """
-    Waits for the board to be identical for 'required_frames' 
-    consecutive successful reads.
-    """
     confidence = 0
     last_detected_board = None
     
     while confidence < required_frames:
         current_board = get_board_state() 
         
-        if last_detected_board is not None and np.array_equal(current_board, last_detected_board):
-            confidence += 1
+        if vision_system.H_matrix is not None and np.any(current_board != 0):
+            # Check for BOTH Kings before allowing the game to proceed
+            if np.any(current_board == game.WHITE_KING) and np.any(current_board == game.BLACK_KING):
+                if last_detected_board is not None and np.array_equal(current_board, last_detected_board):
+                    confidence += 1
+                else:
+                    confidence = 0
+                    last_detected_board = current_board.copy()
+            else:
+                confidence = 0
+                print("Waiting for both Kings to be clearly visible...", end="\r")
         else:
             confidence = 0
-            last_detected_board = current_board
+            if vision_system.H_matrix is None:
+                print("Waiting for all 4 corners to lock Homography...", end="\r")
+        
         time.sleep(0.05) 
         
+    print("\nValid stable board acquired!")
     return last_detected_board
 
-   
 if __name__ == "__main__":
-    color=input("Which color is the bot playing?(w/b): ")
-    game.remaining_time=int(input("Enter the Time control(10/15): "))*60
-    playing_white=(color=='w')
-    if playing_white==True: t=0
-    else: t=-1
-    BOARD= get_stable_board_state()
-    while True:
-        curr = get_stable_board_state()
-        if t%4==0:
-            send_cmd(json.dumps({'T':100}))
-            best_move = move(playing_white)
-            if best_move is None:
-                print("No moves available — game over.")
-                log_result(input("Enter result"),'rglog.txt')
-                break
-            print(f"Best move: {best_move}")
-            for step in movetocmd(best_move):
-                if step == "PICK":  pick()
-                elif step == "PLACE": place()
-                else:send_cmd(step)
-                time.sleep(0.25)
-            send_cmd(json.dumps({'T':100}))
-            BOARD=get_stable_board_state()
-            t+=1
-        elif not np.array_equal(curr, BOARD):
-            move_tuple = log_move(BOARD, curr, 'rglog.txt')
-            if t%4 != 0 and not check_legal(BOARD, move_tuple):
-                with open('rglog.txt', 'a') as f:
-                    f.write("previous move was illegal\n")
-                continue
-            elif t%4==2:
-                start=time.time()
-            elif t%4==3 and t>0:
-                game.remaining_time-=time.time()-start#to account for human player's move and robotic movement delay
-            BOARD=get_stable_board_state()
-            t+=1
-        time.sleep(0.1)   # brief pause before sensing the next board state
+    color = input("Which color is the bot playing?(w/b): ")
+    game.remaining_time = int(input("Enter the Time control(10/15): ")) * 60
+    playing_white = (color == 'w')
+    if playing_white == True: t = 0
+    else: t = -1
+    
+    try:
+        BOARD = get_stable_board_state()
+        while True:
+            curr = get_stable_board_state()
+            if t % 4 == 0:
+                send_cmd(json.dumps({'T':100}))
+                print('Calculating next move...')
+                best_move = move(playing_white)
+                if best_move is None:
+                    print("No moves available — game over.")
+                    log_result(input("Enter result: "), 'rglog.txt')
+                    break
+                print(f"Best move: {best_move}")
+                
+                for step in movetocmd(best_move):
+                    if step == "PICK":  
+                        pick()
+                    elif step == "PLACE": 
+                        place()
+                    else: 
+                        send_cmd(step)
+                    time.sleep(1.0) # Ensures the arm has time to finish moving
+                    
+                send_cmd(json.dumps({'T':100}))
+                BOARD = get_stable_board_state()
+                t += 1
+                
+            elif not np.array_equal(curr, BOARD):
+                move_tuple = log_move(BOARD, curr, 'rglog.txt')
+                if t % 4 != 0 and not check_legal(BOARD, move_tuple):
+                    with open('rglog.txt', 'a') as f:
+                        f.write("previous move was illegal\n")
+                    continue
+                elif t % 4 == 2:
+                    start = time.time()
+                elif t % 4 == 3 and t > 0:
+                    game.remaining_time -= time.time() - start
+                BOARD = get_stable_board_state()
+                t += 1
+            time.sleep(0.1)
+            
+    except KeyboardInterrupt:
+        print("\nShutting down safely...")
+    finally:
+        vision_system.cleanup()
+        ser.close()
+        ser2.close()
+        print("Hardware disconnected.")
