@@ -7,6 +7,7 @@ import time
 import perception
 from perception import BoardPerception
 import json
+import math
 
 # ─── LINUX OS COMPATIBILITY FIX ───────────────────────────────────────────────
 original_apply_move = game.apply_move
@@ -26,6 +27,9 @@ SQUARE_SIZE_X = 58.0
 SQUARE_SIZE_Y = 64.0  
 # ────────────────────────────────────────────────────────────────────────────
 
+EOAT_LEVEL = 0.0   # Trim offset — set to 0 first, then fine-tune on hardware
+
+#
 # Board geometry
 _COL_MAP     = {'A':0,'B':1,'C':2,'D':3,'E':4,'F':5}
 
@@ -156,10 +160,52 @@ def place():
     ser2.write(b'0')
     ser2.flush()
 
+####
+
+def get_feedback():
+    """Send T:105 to arm and return (shoulder_rad, elbow_rad). Returns (None, None) on failure."""
+    try:
+        ser.reset_input_buffer()
+        ser.write(json.dumps({"T": 105}).encode() + b'\n')
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if '{' in line and 'x' in line:
+                snippet = line[line.find('{') : line.rfind('}') + 1]
+                data = json.loads(snippet)
+                return data.get('s', 0.0), data.get('e', 0.0)
+    except Exception as ex:
+        print(f"[WARN] Feedback read failed: {ex}")
+    return None, None
+
+def compute_t_level():
+    """Compute the wrist angle (radians) that keeps EOAT flat, from live joint angles."""
+    s, e = get_feedback()
+    if s is None:
+        print("[WARN] Falling back to static T_ANGLE for wrist.")
+        return T_ANGLE          # safe fallback if feedback is lost
+    return math.pi / 2 - s + e - EOAT_LEVEL
+
+####
+
 def send_cmd(command: str):
     print(f"Sending command: {command}")
     ser.write(command.encode() + b'\n')
     ser.flush()
+
+####
+
+def send_arm_cmd(json_str: str):
+    """
+    Send an arm movement command, replacing the static wrist angle
+    with a live-computed value so the EOAT stays level throughout motion.
+    """
+    cmd = json.loads(json_str)
+    if cmd.get("T") == 104:
+        cmd["t"] = round(compute_t_level(), 5)
+    send_cmd(json.dumps(cmd))
+
+####
 
 COL_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F']
 LOG_FILE = "game_log.txt"
@@ -283,7 +329,7 @@ if __name__ == "__main__":
                         place()
                         time.sleep(0.5)
                     else:
-                        send_cmd(step)
+                        send_arm_cmd(step)
                         time.sleep(3.0) # Ensures the arm has time to finish moving
 
                 BOARD = get_stable_board_state()
