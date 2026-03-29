@@ -7,7 +7,6 @@ import time
 import perception
 from perception import BoardPerception
 import json
-import os
 
 # ─── LINUX OS COMPATIBILITY FIX ───────────────────────────────────────────────
 original_apply_move = game.apply_move
@@ -20,20 +19,12 @@ def safe_apply_move(board, piece, r1, c1, r2, c2, promo, offboard, king_tracker,
 game.apply_move = safe_apply_move
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── DYNAMIC CALIBRATION LOADER ──
-CALIB = {
-    "TOP_LEFT_X": 133.0,
-    "TOP_LEFT_Y": -119.4,
-    "SQUARE_SIZE_X": 71.0,
-    "SQUARE_SIZE_Y": 59.0
-}
-if os.path.exists("robot_calib.json"):
-    with open("robot_calib.json", "r") as f:
-        CALIB = json.load(f)
-        print("Loaded physical robot calibration from robot_calib.json ✓")
-else:
-    print("No robot_calib.json found. Using fallback coordinates.")
-# ────────────────────────────────
+# ── HARDCODED CALIBRATION (Calculated from A1: 180, -200 and F6: 470, 120) ──
+TOP_LEFT_X = 180.0
+TOP_LEFT_Y = -200.0
+SQUARE_SIZE_X = 58.0  
+SQUARE_SIZE_Y = 64.0  
+# ────────────────────────────────────────────────────────────────────────────
 
 # Board geometry
 _COL_MAP     = {'A':0,'B':1,'C':2,'D':3,'E':4,'F':5}
@@ -50,26 +41,31 @@ DISCARD_X, DISCARD_Y = -150, 0
 
 # Reserve positions for promotion pieces (world mm)
 RESERVE_POS = {
-    4: (-150, -100),   # White Queen  reserve
-    3: (-150, -200),   # White Bishop reserve
-    2: (-150, -300),   # White Knight reserve
-    9:  (450, -100),   # Black Queen  reserve
-    8:  (450, -200),   # Black Bishop reserve
-    7:  (450, -300),   # Black Knight reserve
+    4: (-150, -100),   
+    3: (-150, -200),   
+    2: (-150, -300),   
+    9:  (450, -100),   
+    8:  (450, -200),   
+    7:  (450, -300),   
 }
 
 BOARD = np.zeros((6, 6), dtype=int)
-# Serial ports
-ser = serial.Serial("/dev/ttyUSB1", baudrate=115200, dsrdtr=None)
-ser.setRTS(False)
-ser.setDTR(False)
-ser2 = serial.Serial('/dev/ttyUSB0', 115200) 
+
+# ── SERIAL CONNECTION BLOCK ──
+print("Connecting to hardware...")
+# Using COM8 and COM10 as seen in your last snippet
+ser = serial.Serial("COM8", baudrate=115200)
+ser2 = serial.Serial("COM10", baudrate=115200)
+
+# CRITICAL: Let the arm boot up for 2 seconds after Windows opens the port!
+time.sleep(2.0)
+ser.reset_input_buffer()
+print("Hardware connected and ready ✓")
 
 POSES = {}
 vision_system = BoardPerception()
 
 def get_board_state() -> np.ndarray:
-    """Use the perception module to get the current board state."""
     global BOARD, POSES
     latest_board, latest_poses = vision_system.get_latest_state()
     if latest_board is not None:
@@ -78,7 +74,6 @@ def get_board_state() -> np.ndarray:
     return BOARD
 
 def move(playing_white) -> str:
-    """Determine the best move using the game module."""
     return game.get_best_move(get_board_state(), playing_white)
 
 def movetocmd(move_str: str) -> list:
@@ -86,10 +81,10 @@ def movetocmd(move_str: str) -> list:
         """Translates the 6x6 grid into physical Robot coordinates."""
         row_idx = ord(cell[0].upper()) - ord('A')
         col_idx = int(cell[1]) - 1
-        
-        # Pulls directly from your CALIB dictionary
-        wx = CALIB["TOP_LEFT_X"] + (row_idx * CALIB["SQUARE_SIZE_X"])
-        wy = CALIB["TOP_LEFT_Y"] + (col_idx * CALIB["SQUARE_SIZE_Y"])
+
+        # Uses the newly calculated hardcoded math
+        wx = TOP_LEFT_X + (row_idx * SQUARE_SIZE_X)
+        wy = TOP_LEFT_Y + (col_idx * SQUARE_SIZE_Y)
         return wx, wy
 
     def arm_goto(x, y, z):
@@ -155,13 +150,16 @@ def movetocmd(move_str: str) -> list:
 
 def pick():
     ser2.write(b'1')
+    ser2.flush()
 
 def place():
     ser2.write(b'0')
+    ser2.flush()
 
 def send_cmd(command: str):
     print(f"Sending command: {command}")
     ser.write(command.encode() + b'\n')
+    ser.flush()
 
 COL_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F']
 LOG_FILE = "game_log.txt"
@@ -187,7 +185,7 @@ def log_move(prev_board: np.ndarray, curr_board: np.ndarray, log_file: str = LOG
                 replaced.append((r, c, pv, cv))
 
     if not vacated:
-        return 
+        return
 
     src_r, src_c, moved_piece = vacated[0]
     src_cell = _idx_to_cell(src_r, src_c)
@@ -232,10 +230,10 @@ def check_legal(prev_board, move_tuple):
 def get_stable_board_state(required_frames=10):
     confidence = 0
     last_detected_board = None
-    
+
     while confidence < required_frames:
-        current_board = get_board_state() 
-        
+        current_board = get_board_state()
+
         if vision_system.H_matrix is not None and np.any(current_board != 0):
             # Check for BOTH Kings before allowing the game to proceed
             if np.any(current_board == game.WHITE_KING) and np.any(current_board == game.BLACK_KING):
@@ -251,10 +249,9 @@ def get_stable_board_state(required_frames=10):
             confidence = 0
             if vision_system.H_matrix is None:
                 print("Waiting for all 4 corners to lock Homography...", end="\r")
-        
-        time.sleep(0.05) 
-        
-    print("\nValid stable board acquired!")
+
+        time.sleep(0.05)
+
     return last_detected_board
 
 if __name__ == "__main__":
@@ -263,13 +260,13 @@ if __name__ == "__main__":
     playing_white = (color == 'w')
     if playing_white == True: t = 0
     else: t = -1
-    
+
     try:
         BOARD = get_stable_board_state()
+        print("\nValid stable board acquired!")
         while True:
             curr = get_stable_board_state()
             if t % 4 == 0:
-                send_cmd(json.dumps({'T':100}))
                 print('Calculating next move...')
                 best_move = move(playing_white)
                 if best_move is None:
@@ -277,20 +274,21 @@ if __name__ == "__main__":
                     log_result(input("Enter result: "), 'rglog.txt')
                     break
                 print(f"Best move: {best_move}")
-                
+
                 for step in movetocmd(best_move):
-                    if step == "PICK":  
+                    if step == "PICK":
                         pick()
-                    elif step == "PLACE": 
+                        time.sleep(0.5)
+                    elif step == "PLACE":
                         place()
-                    else: 
+                        time.sleep(0.5)
+                    else:
                         send_cmd(step)
-                    time.sleep(1.0) # Ensures the arm has time to finish moving
-                    
-                send_cmd(json.dumps({'T':100}))
+                        time.sleep(3.0) # Ensures the arm has time to finish moving
+
                 BOARD = get_stable_board_state()
                 t += 1
-                
+
             elif not np.array_equal(curr, BOARD):
                 move_tuple = log_move(BOARD, curr, 'rglog.txt')
                 if t % 4 != 0 and not check_legal(BOARD, move_tuple):
@@ -304,7 +302,7 @@ if __name__ == "__main__":
                 BOARD = get_stable_board_state()
                 t += 1
             time.sleep(0.1)
-            
+
     except KeyboardInterrupt:
         print("\nShutting down safely...")
     finally:
